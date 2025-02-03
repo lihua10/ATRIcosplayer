@@ -87,6 +87,7 @@ def load_data(file_path):
             "prompt": prompt,
             "response": response
         })
+
     return Dataset.from_list(processed)
 
 raw_dataset = load_data(DATA_PATH)
