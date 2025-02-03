@@ -54,7 +54,8 @@ def preprocess_line(line):
     tags = re.findall(r'<([^>]+)>', line)
     for tag in tags:
         role_tags.add(f"<{tag}>")
-    
+
+
     return line
 
 def file_reader(dir_path):
