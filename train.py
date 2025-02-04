@@ -28,9 +28,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ================ 量化配置（4-bit） ==================
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
+    bnb_4bit_use_double_quant=False,
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16
+    bnb_4bit_compute_dtype=torch.float32
 )
 
 # ================ 加载模型和 Tokenizer ==================
@@ -147,22 +147,23 @@ def tokenize_example(example):
     
     assistant_id = tokenizer.convert_tokens_to_ids("<|assistant|>")
     input_ids = tokenized["input_ids"]
+    labels = input_ids.copy()
     if assistant_id in input_ids:
         assistant_index = input_ids.index(assistant_id)
-
-
-        # 保证 assistant 标记后至少有一个 token 用于计算 loss
         if assistant_index + 1 >= len(input_ids):
-            print("Warning: assistant 标记后无有效 token，使用完整 input_ids")
             tokenized["labels"] = input_ids.copy()
         else:
-            labels = input_ids.copy()
-            # mask 掉 assistant 标记之前部分
             for i in range(assistant_index + 1):
                 labels[i] = -100
             tokenized["labels"] = labels
     else:
         tokenized["labels"] = input_ids.copy()
+    
+    # 调试：确保存在非-100的label
+    valid_tokens = sum(1 for t in tokenized["labels"] if t != -100)
+    if valid_tokens == 0:
+        print("警告：该样例所有 token 均为 mask(-100)")
+    
     return tokenized
 
 
@@ -203,22 +204,17 @@ def custom_data_collator(features):
 # ================ 训练参数 ==================
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=4,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
     num_train_epochs=3,
-    # 先使用一个更低的学习率，排查数值稳定性问题
     learning_rate=1e-5,
     logging_steps=1,
     logging_first_step=True,
-    logging_strategy="steps",
-    # 为排查问题暂时关闭混合精度及 8bit optimizer
-    fp16=False,                       
-    optim="adamw",                    
+    disable_tqdm=False,
+    dataloader_num_workers=0,
     save_strategy="steps",
     save_steps=200,
     report_to="none",
-    disable_tqdm=False,
-    max_grad_norm=1.0,
 )
 
 # 如果需要自定义日志回调，可保留或修改已有 TrainProgressCallback
@@ -244,7 +240,35 @@ trainer = Trainer(
     callbacks=[TrainProgressCallback()]
 )
 
-trainer.train()
+# 禁用梯度检查点（确保不要调用 enable）
+model.gradient_checkpointing_disable()
+model.config.use_cache = False  # 确保缓存关闭
+assert model.training  # 必须处于训练模式
+
+# 添加验证代码
+# print(model)  # 输出应包含lora层
+# assert any("lora" in n for n, _ in model.named_parameters()), "LoRA未正确应用"
+
+# 验证LoRA参数可训练性
+# for name, param in model.named_parameters():
+#     if param.requires_grad:
+#         print(f"{name} | shape: {param.shape}")
+
+if __name__ == "__main__":
+    # 调试单步前向传播
+    print("开始单步前向传播测试...")
+    sample = tokenized_dataset[0]
+    batch = custom_data_collator([sample])
+    # 确保所有 tensor 均移动到模型设备上
+    batch = {k: v.to(next(model.parameters()).device) for k, v in batch.items()}
+    outputs = model(**batch)
+    loss = outputs.loss
+    print("测试 loss:", loss.item())
+    loss.backward()  # 单步反向传播测试
+    print("单步测试通过，开始正式训练...")
+
+    # 开始正式训练
+    trainer.train()
 
 # 保存 LoRA 适配器（或整个模型，根据需求）
 model.save_pretrained(os.path.join(OUTPUT_DIR, "final_adapter"))

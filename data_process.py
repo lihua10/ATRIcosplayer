@@ -128,7 +128,7 @@ def data_process(all_lines):
 
 
                 # 获取上下文范围（修正结束位置）
-                context_start = max(0, line_idx_user - 50)
+                context_start = max(0, line_idx_user - 30)
                 context_end = max(0, line_idx_user)  # 排除用户输入行
                 context = lines[context_start : context_end]
                 
