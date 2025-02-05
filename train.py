@@ -1,28 +1,32 @@
 # -*- coding: utf-8 -*-
 # train.py
 import os
+import shutil
 # 设置 CUDA 内存分配相关环境变量，降低内存碎片风险
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
 import json
 import torch
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
     TrainingArguments,
     Trainer,
-    TrainerCallback
+    TrainerCallback,
 )
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from tqdm.auto import tqdm
 import time
+import traceback
+import sys
+import gc
 
 # ================ 配置参数 ==================
 MODEL_PATH = r"C:\Users\LH\.cache\huggingface\hub\models--deepseek-ai--DeepSeek-R1-Distill-Qwen-7B\snapshots\14dd1130311655b43c3ce41dd505f70f6ca89845"
 DATA_PATH = "data/dataset.json"  # 数据文件，格式为 JSON，包含 "data" 字段
-OUTPUT_DIR = "lora_output"
+OUTPUT_DIR = r"F:\output"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ================ 量化配置（4-bit） ==================
@@ -30,7 +34,7 @@ bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_use_double_quant=False,
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float32
+    bnb_4bit_compute_dtype=torch.bfloat16
 )
 
 # ================ 加载模型和 Tokenizer ==================
@@ -43,11 +47,26 @@ model = AutoModelForCausalLM.from_pretrained(
     quantization_config=bnb_config
 )
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
-# 添加特殊标记，确保这些标记不被拆分
-special_tokens_dict = {"additional_special_tokens": ["<???>", "<不知是谁的声音>", "<乃音子>", "<亚托莉>", "<亚托莉的声音>", "<凛凛花>", "<凛凛花的声音>", "<凯瑟琳>", "<凯瑟琳的声音>", "<初中部男生>", "<大家>", "<女性的声音>", "<妻>", "<孩子Ａ>", "<孩子Ｂ>", "<孩子Ｃ>", "<安田>", "<富田>", "<小龙>", "<少女>", "<居民 A>", "<居民 B>", "<广播>", "<废品店老板>", "<心>", "<快递小哥>", "<摊主>", "<早间广播>", "<机器人少女>", "<水菜萌>", "<水菜萌的声音>", "<水菜萌的妈妈>", "<没见过的男子>", "<洋子>", "<猫？>", "<用户>", "<用户・水菜萌>", "<用户的声音>", "<电视>", "<糖果店的大妈>", "<美代>", "<肉店老板娘>", "<融>", "<诗菜>", "<陌生人>", "<陌生人的声音>", "<高中部的男子>", "<龙司>", "<龙司的声音>", "<ＤＪ>","<context>","<|assistant|>", "<|user|>", "<|system|>"]}
-num_added_tokens = tokenizer.add_special_tokens(special_tokens_dict)
-if num_added_tokens > 0:
-    model.resize_token_embeddings(len(tokenizer))
+# 修改前
+# tokenizer.add_special_tokens(special_tokens_dict)
+
+# 修改后
+custom_tokens = [
+    "<???>", "<不知是谁的声音>", "<乃音子>", "<亚托莉>",
+    "<亚托莉的声音>", "<凛凛花>", "<凯瑟琳>", "<少女>",
+    "<机器人少女>", "<水菜萌>", "<洋子>", "<用户>",
+    "<用户・水菜萌>", "<美代>", "<诗菜>",
+    "<陌生人>", "<龙司>"
+]
+num_added = tokenizer.add_tokens(custom_tokens)  # 正确方式
+
+# 系统标记保持特殊标记
+system_tokens = ["<|assistant|>", "<|user|>", "<|system|>"]
+tokenizer.add_special_tokens({"additional_special_tokens": system_tokens})
+tokenizer.save_pretrained(os.path.join(OUTPUT_DIR, "final_tokenizer"))
+# 调整嵌入层大小以匹配分词器（非常关键！）
+model.resize_token_embeddings(len(tokenizer))
+
 # 若模型未设置 pad_token，则使用 eos_token
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
@@ -57,9 +76,16 @@ if tokenizer.pad_token is None:
 lora_config = LoraConfig(
     task_type="CAUSAL_LM",
     inference_mode=False,
-    r=8,
+    r=8,  # 秩，可根据需要调整
     lora_alpha=32,
-    lora_dropout=0.1
+    lora_dropout=0.1,
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",  # 原始适配的注意力层
+        "embed_tokens",  # 嵌入层
+        "lm_head"       # 输出层
+    ],
+    modules_to_save=[],  # 确保不保存任何层的全量参数
+    bias="none"
 )
 model = get_peft_model(model, lora_config)
 
@@ -132,7 +158,7 @@ def shorten_user_section(text: str, keep_ratio: float = 1) -> str:
 def tokenize_example(example):
     # 构造训练文本：包含 system、user、assistant 三个部分
     full_text = (
-        "<|system|>\n你是一个名为亚托莉的少女，请用角色身份回答。\n以下是上下文背景：\n"+ example["context"]+"\n"
+        "<|system|>\n你是一个名为亚托莉的少女，请用角色身份回答。请注意，回答时请不要输出特殊标记尖括号（<>）（但输出其中包裹的人名）,也不要输出<|system|>、<|user|>、<|assistant|>，这些特殊标记仅用于内部提示。\n以下是上下文背景：\n"+ example["context"]+"\n"
         "<|user|>\n" + example["prompt"].strip() + "\n"
         "<|assistant|>\n" + example["response"].strip()
 
@@ -143,7 +169,7 @@ def tokenize_example(example):
     
     tokenized = tokenizer(full_text, truncation=False)
     decoded = tokenizer.decode(tokenized["input_ids"])
-    print("Decoded full text:\n", decoded)
+    # print("Decoded full text:\n", decoded)
     
     assistant_id = tokenizer.convert_tokens_to_ids("<|assistant|>")
     input_ids = tokenized["input_ids"]
@@ -173,7 +199,7 @@ def tokenize_example(example):
 tokenized_dataset = raw_dataset.map(tokenize_example, remove_columns=raw_dataset.column_names)
 
 # 打印一个样本，检查 token 化结果是否合理
-print("示例 tokenized 数据：", tokenized_dataset[0])
+# print("示例 tokenized 数据：", tokenized_dataset[0])
 
 # ================ 自定义 Collator ==================
 def custom_data_collator(features):
@@ -201,23 +227,62 @@ def custom_data_collator(features):
     }
     return batch
 
-# ================ 训练参数 ==================
+# ================ 新增配置管理类 ==================
+class TrainingConfigManager:
+    CONFIG_FILE = "training_config.json"
+    
+    def __init__(self, initial_config):
+        self.config = initial_config
+        self.load_config()
+    
+    def load_config(self):
+        if os.path.exists(self.CONFIG_FILE):
+            with open(self.CONFIG_FILE, 'r') as f:
+                saved_config = json.load(f)
+                self.config.update(saved_config)
+    
+    def save_config(self):
+        with open(self.CONFIG_FILE, 'w') as f:
+            json.dump(self.config, f)
+    
+    def adjust_after_oom(self):
+        # 每次OOM后调整参数
+        self.config['per_device_train_batch_size'] = max(1, self.config['per_device_train_batch_size'] // 2)
+        self.config['gradient_accumulation_steps'] = self.config['gradient_accumulation_steps'] * 2
+        self.save_config()
+
+# ================ 修改训练参数初始化 ==================
+initial_config = {
+    'per_device_train_batch_size': 1,
+    'gradient_accumulation_steps': 8,
+    'learning_rate': 1e-5,
+    'max_retries': 20  # 最大重试次数
+}
+
+config_manager = TrainingConfigManager(initial_config)
+
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=8,
+    per_device_train_batch_size=config_manager.config['per_device_train_batch_size'],
+    gradient_accumulation_steps=config_manager.config['gradient_accumulation_steps'],
+    learning_rate=config_manager.config['learning_rate'],
     num_train_epochs=3,
-    learning_rate=1e-5,
     logging_steps=1,
-    logging_first_step=True,
-    disable_tqdm=False,
-    dataloader_num_workers=0,
     save_strategy="steps",
-    save_steps=200,
+    save_steps=25,
+
+    save_total_limit=10000,  # 增加保存数量限制
     report_to="none",
+    remove_unused_columns=False,
+    load_best_model_at_end=False,
+    optim="adamw_8bit",      # 使用更省内存的优化器
+    dataloader_pin_memory=False,  # 减少内存占用
+
+    bf16=True,   # 启用 BF16 模式
+    fp16=False   # 确保不使用 FP16
 )
 
-# 如果需要自定义日志回调，可保留或修改已有 TrainProgressCallback
+# ================ 自定义日志回调 ==================
 class TrainProgressCallback(TrainerCallback):
     def __init__(self):
         self.start_time = time.time()
@@ -231,13 +296,23 @@ class TrainProgressCallback(TrainerCallback):
             time_elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - self.start_time))
             print(f"{epoch_info:<7}{mem:>10}{loss_info:>12}{lr_info:>12}{time_elapsed:>10}")
 
-# ================ 开始训练 ==================
+# ================ 在训练脚本中添加回调 ==================
+class SaveTokenizerCallback(TrainerCallback):
+    def on_save(self, args, state, control, **kwargs):
+        output_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        kwargs["tokenizer"].save_pretrained(output_dir)
+        return control
+
+# ================ 修改训练器初始化 ==================
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_dataset,
     data_collator=custom_data_collator,
-    callbacks=[TrainProgressCallback()]
+    callbacks=[
+        TrainProgressCallback(),
+        SaveTokenizerCallback()
+    ]
 )
 
 # 禁用梯度检查点（确保不要调用 enable）
@@ -245,30 +320,59 @@ model.gradient_checkpointing_disable()
 model.config.use_cache = False  # 确保缓存关闭
 assert model.training  # 必须处于训练模式
 
-# 添加验证代码
-# print(model)  # 输出应包含lora层
-# assert any("lora" in n for n, _ in model.named_parameters()), "LoRA未正确应用"
+# 打印可训练参数
+for name, param in model.named_parameters():
+    if param.requires_grad:
+        print(f"可训练参数: {name} | 形状: {param.shape}")
 
-# 验证LoRA参数可训练性
-# for name, param in model.named_parameters():
-#     if param.requires_grad:
-#         print(f"{name} | shape: {param.shape}")
+# 预期输出应包含类似以下内容（具体名称因模型而异）：
+# "base_model.model.model.embed_tokens.lora_A.weight"
+# "base_model.model.model.embed_tokens.lora_B.weight"
+# "base_model.model.lm_head.lora_A.weight"
+# "base_model.model.lm_head.lora_B.weight"
+
+# 确保保存完整配置
+model.save_pretrained(
+    OUTPUT_DIR,
+    safe_serialization=True,
+    save_embedding_layers="all"  # 关键参数
+)
+
+
 
 if __name__ == "__main__":
-    # 调试单步前向传播
-    print("开始单步前向传播测试...")
-    sample = tokenized_dataset[0]
-    batch = custom_data_collator([sample])
-    # 确保所有 tensor 均移动到模型设备上
-    batch = {k: v.to(next(model.parameters()).device) for k, v in batch.items()}
-    outputs = model(**batch)
-    loss = outputs.loss
-    print("测试 loss:", loss.item())
-    loss.backward()  # 单步反向传播测试
-    print("单步测试通过，开始正式训练...")
+    while True:
+        try:
+            torch.cuda.empty_cache()
+            gc.collect()
+            trainer.train(resume_from_checkpoint=True)
+            break
+        except Exception as e:
+            print(e)
 
-    # 开始正式训练
-    trainer.train()
-
-# 保存 LoRA 适配器（或整个模型，根据需求）
-model.save_pretrained(os.path.join(OUTPUT_DIR, "final_adapter"))
+    # 最终保存
+    model.to("cpu")
+    
+    # 确保分词器 pad_token 设置
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # 保存适配器和分词器
+    trainer.model.save_pretrained(os.path.join(OUTPUT_DIR, "final_adapter"))
+    model.save_pretrained(os.path.join(OUTPUT_DIR, "final_adapter"))
+    tokenizer.save_pretrained(os.path.join(OUTPUT_DIR, "final_tokenizer"))
+    
+    # 验证加载
+    from peft import PeftModel
+    base_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        device_map="auto",
+        trust_remote_code=True
+    )
+    loaded_model = PeftModel.from_pretrained(base_model, os.path.join(OUTPUT_DIR, "final_adapter"))
+    
+    # 测试推理
+    input_text = "<|user|>\n你好<亚托莉>\n<|assistant|>\n"
+    inputs = tokenizer(input_text, return_tensors="pt").to(DEVICE)
+    outputs = loaded_model.generate(**inputs, max_new_tokens=50)
+    print("测试输出:", tokenizer.decode(outputs[0]))
