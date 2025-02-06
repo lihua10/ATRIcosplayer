@@ -52,10 +52,9 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 
 # 修改后
 custom_tokens = [
-    "<???>", "<不知是谁的声音>", "<乃音子>", "<亚托莉>",
+    "<乃音子>", "<亚托莉>",
     "<亚托莉的声音>", "<凛凛花>", "<凯瑟琳>", "<少女>",
     "<机器人少女>", "<水菜萌>", "<洋子>", "<用户>",
-    "<用户・水菜萌>", "<美代>", "<诗菜>",
     "<陌生人>", "<龙司>"
 ]
 num_added = tokenizer.add_tokens(custom_tokens)  # 正确方式
@@ -117,43 +116,6 @@ def load_data(file_path):
     return Dataset.from_list(processed)
 
 raw_dataset = load_data(DATA_PATH)
-
-# ================ 自定义 Tokenize 函数 ==================
-def shorten_user_section(text: str, keep_ratio: float = 1) -> str:
-    """
-    将文本中所有的</user/>部分裁剪，只保留后 keep_ratio 比例的行。
-    例如，keep_ratio=0.5 表示保留每个 </user/> 块中后 50% 的行，
-    这样可以保留紧跟着亚托莉回答的对话上下文。
-
-
-    参数:
-        text: 完整的原始文本。
-        keep_ratio: 保留的行比例，默认为 0.5（即一半）。
-
-    返回:
-        裁剪后的文本。
-    """
-    # 以 <|user|> 分割文本，第一部分通常不是 user 对话内容
-    parts = text.split("<|user|>")
-    if len(parts) == 1:
-        return text  # 如果找不到 <|user|> 则直接返回原文本
-
-
-
-
-
-    new_text = parts[0]
-    # 对每个 <|user|> 部分处理：只保留每个部分的后 keep_ratio 部分
-    for user_block in parts[1:]:
-        lines = user_block.splitlines()
-        # 至少保留一行
-        num_keep = max(1, int(len(lines) * keep_ratio))
-        # 保留后面的 num_keep 行
-        shortened = "\n".join(lines[-num_keep:])
-        new_text += "<|user|>" + shortened
-    return new_text
-
-
 
 def tokenize_example(example):
     # 构造训练文本：包含 system、user、assistant 三个部分
