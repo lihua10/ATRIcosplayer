@@ -40,15 +40,15 @@ def preprocess_line(line):
     line = line.strip()
     
     if line.startswith("亚托莉\t"):
-        line =  f"<亚托莉>:{line[4:]}"
+        line =  f"亚托莉：{line[4:]}"
     
     if "\t" in line:
         role, content = line.split("\t", 1)
         role = role.replace("斑鸠夏生", "夏生").replace("夏生", "用户")
-        content = content.replace("斑鸠夏生", "夏生").replace("夏生", "<用户>")
-        line = f"<{role}>:{content}"
+        content = content.replace("斑鸠夏生", "夏生").replace("夏生", "用户")
+        line = f"{role}：{content}"
     else:
-        line = line.replace("斑鸠夏生", "夏生").replace("夏生", "<用户>").replace("我们","<用户>和亚托莉").replace("我","<用户>")
+        line = line.replace("斑鸠夏生", "夏生").replace("夏生", "用户").replace("我们","用户和亚托莉").replace("我","用户")
 
     # 新增标签收集逻辑（处理所有<...>形式的标签）
     tags = re.findall(r'<([^>]+)>', line)
@@ -103,7 +103,7 @@ def data_process(all_lines):
             current_line = lines[line_idx]
             
             # 检测亚托莉对话起始点
-            if current_line.startswith("<亚托莉>"):
+            if current_line.startswith("亚托莉"):
                 # 记录起始位置
                 start_idx = line_idx
                 
@@ -111,7 +111,7 @@ def data_process(all_lines):
                 while line_idx < len(lines):
                     current_line = lines[line_idx]
                     # 允许合并的类型：亚托莉对话或旁白
-                    if not (current_line.startswith("<亚托莉>") or current_line.startswith("(")):
+                    if not (current_line.startswith("亚托莉") or current_line.startswith("(")):
                         break
                     line_idx += 1
                 
@@ -120,7 +120,7 @@ def data_process(all_lines):
                 while line_idx_user > 0:
                     current_line = lines[line_idx_user]
 
-                    if not (current_line.startswith("<用户>") or current_line.startswith("(")):
+                    if not (current_line.startswith("用户") or current_line.startswith("(")):
                         break
                     line_idx_user -= 1
 
@@ -138,22 +138,22 @@ def data_process(all_lines):
                     "lines_index": lines_idx,
                     "line_index": line_idx_user,
                     "context": context,
-                    "<用户>": [
-                        line.replace("<用户>:", "") if line.startswith("<用户>")
+                    "input": [
+                        line.replace("用户：", "") if line.startswith("用户")
                         else line  # 旁白行保持原样
                         for line in lines[line_idx_user+1:start_idx]
                     ],
 
 
-                    "<亚托莉>": [
-                        line.replace("<亚托莉>:", "") if line.startswith("<亚托莉>")
+                    "output": [
+                        line.replace("亚托莉：", "") if line.startswith("亚托莉")
                         else line  # 旁白行保持原样
                         for line in lines[start_idx:line_idx]
                     ]
                 }
                 
-
-                dataset["data"].append(entry)
+                if len(entry["input"]) > 0:
+                    dataset["data"].append(entry)
             else:
                 line_idx += 1
     

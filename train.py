@@ -22,6 +22,8 @@ import time
 import traceback
 import sys
 import gc
+import psutil
+from torch.utils import cpp_extension
 
 # ================ 配置参数 ==================
 MODEL_PATH = r"C:\Users\LH\.cache\huggingface\hub\models--deepseek-ai--DeepSeek-R1-Distill-Qwen-7B\snapshots\14dd1130311655b43c3ce41dd505f70f6ca89845"
@@ -32,9 +34,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ================ 量化配置（4-bit） ==================
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
-    bnb_4bit_use_double_quant=False,
+    bnb_4bit_use_double_quant=True,  # 启用双重量化
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16
+    bnb_4bit_compute_dtype=torch.float16
 )
 
 # ================ 加载模型和 Tokenizer ==================
@@ -52,10 +54,10 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 
 # 修改后
 custom_tokens = [
-    "<乃音子>", "<亚托莉>",
-    "<亚托莉的声音>", "<凛凛花>", "<凯瑟琳>", "<少女>",
-    "<机器人少女>", "<水菜萌>", "<洋子>", "<用户>",
-    "<陌生人>", "<龙司>"
+    "乃音子", "亚托莉",
+    "凛凛花", "凯瑟琳",
+    "水菜萌", "洋子", "用户",
+    "陌生人", "龙司"
 ]
 num_added = tokenizer.add_tokens(custom_tokens)  # 正确方式
 
@@ -105,8 +107,8 @@ def load_data(file_path):
     processed = []
     for item in data:
         context = "".join(item["context"]).strip()
-        prompt = "".join(item["<用户>"]).strip()
-        response = "".join(item["<亚托莉>"]).strip()
+        prompt = "".join(item["input"]).strip()
+        response = "".join(item["output"]).strip()
         processed.append({
             "context" : context,
             "prompt": prompt,
@@ -160,27 +162,42 @@ def tokenize_example(example):
 # 对整个数据集应用 tokenize
 tokenized_dataset = raw_dataset.map(tokenize_example, remove_columns=raw_dataset.column_names)
 
+# 计算所有样本的长度
+lengths = [len(x["input_ids"]) for x in tokenized_dataset]
+sorted_lengths = sorted(lengths)
+
+# 舍弃后 5% 超长数据，并使用剩余 95% 样本中的最大长度作为固定 padding 长度
+cutoff_index = int(len(sorted_lengths) * 0.95)
+# 注意：如果 n=100，cutoff_index 为95，对应索引 0~94，共 95 个样本；此时取最大值为 sorted_lengths[94]
+global_max_length = sorted_lengths[cutoff_index - 1]
+print(f"使用前95%数据中的最大token长度作为固定 padding 长度: {global_max_length}")
+
+# 过滤掉长度超过 global_max_length 的样本（直接舍弃后 5% 的数据，之后永不参与计算）
+def filter_extreme_samples(example):
+    return len(example["input_ids"]) <= global_max_length
+
+tokenized_dataset = tokenized_dataset.filter(filter_extreme_samples)
+
 # 打印一个样本，检查 token 化结果是否合理
 # print("示例 tokenized 数据：", tokenized_dataset[0])
 
 # ================ 自定义 Collator ==================
 def custom_data_collator(features):
     """
-    自定义 collator：对 input_ids、attention_mask、labels 手动 padding 到 batch 内最长序列长度。
-    labels 中用于 loss 的 -100 也会被补充到合适位置，保证训练数据形状一致。
+    自定义 collator：对 input_ids、attention_mask、labels 使用全局固定的 pad 长度进行 padding。
     """
     # 分别提取各个字段
     input_ids = [f['input_ids'] for f in features]
     attention_masks = [f['attention_mask'] for f in features]
     labels = [f['labels'] for f in features]
 
-    # 获取本 batch 中最长的长度
-    max_length = max(len(ids) for ids in input_ids)
+    # 使用预先计算好的全局固定 pad 长度，即 global_max_length
+    pad_length = global_max_length
 
-    # 对 input_ids 进行 padding，pad_token_id 填充；对 attention_mask 填充 0；对 labels 填充 -100
-    padded_input_ids = [ids + [tokenizer.pad_token_id] * (max_length - len(ids)) for ids in input_ids]
-    padded_attention_masks = [mask + [0] * (max_length - len(mask)) for mask in attention_masks]
-    padded_labels = [lab + [-100] * (max_length - len(lab)) for lab in labels]
+    # 对 input_ids 进行 padding：tokenizer.pad_token_id 填充；attention_mask 填充 0；labels 填充 -100
+    padded_input_ids = [ids + [tokenizer.pad_token_id] * (pad_length - len(ids)) for ids in input_ids]
+    padded_attention_masks = [mask + [0] * (pad_length - len(mask)) for mask in attention_masks]
+    padded_labels = [lab + [-100] * (pad_length - len(lab)) for lab in labels]
 
     batch = {
         "input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
@@ -206,17 +223,12 @@ class TrainingConfigManager:
     def save_config(self):
         with open(self.CONFIG_FILE, 'w') as f:
             json.dump(self.config, f)
-    
-    def adjust_after_oom(self):
-        # 每次OOM后调整参数
-        self.config['per_device_train_batch_size'] = max(1, self.config['per_device_train_batch_size'] // 2)
-        self.config['gradient_accumulation_steps'] = self.config['gradient_accumulation_steps'] * 2
-        self.save_config()
+
 
 # ================ 修改训练参数初始化 ==================
 initial_config = {
     'per_device_train_batch_size': 1,
-    'gradient_accumulation_steps': 8,
+    'gradient_accumulation_steps': 4,
     'learning_rate': 1e-5,
     'max_retries': 20  # 最大重试次数
 }
@@ -231,13 +243,13 @@ training_args = TrainingArguments(
     num_train_epochs=3,
     logging_steps=1,
     save_strategy="steps",
-    save_steps=25,
+    save_steps=100,
 
-    save_total_limit=10000,  # 增加保存数量限制
+    save_total_limit=3,  # 增加保存数量限制
     report_to="none",
     remove_unused_columns=False,
     load_best_model_at_end=False,
-    optim="adamw_8bit",      # 使用更省内存的优化器
+    optim="paged_adamw_8bit",  # 使用分页优化器
     dataloader_pin_memory=False,  # 减少内存占用
 
     bf16=True,   # 启用 BF16 模式
@@ -261,9 +273,28 @@ class TrainProgressCallback(TrainerCallback):
 # ================ 在训练脚本中添加回调 ==================
 class SaveTokenizerCallback(TrainerCallback):
     def on_save(self, args, state, control, **kwargs):
+        torch.cuda.empty_cache()
+        # 强制整理内存碎片
+        # torch.cuda.memory._record_memory_history()
+        # torch.cuda.memory._dump_snapshot()
+        gc.collect()
+        
         output_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-        kwargs["tokenizer"].save_pretrained(output_dir)
-        return control
+        kwargs["model"].save_pretrained(
+            output_dir,
+            safe_serialization=True,
+            save_embedding_layers="unmerged"  # 确保不合并
+        )
+
+# ================ 创建内存监控回调 ==================
+class MemoryMonitorCallback(TrainerCallback):
+    def __init__(self, log_steps=10):
+        self.log_steps = log_steps
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.log_steps == 0:
+            print_memory_usage(f"Step {state.global_step}")
+            print_gpu_memory_info()
 
 # ================ 修改训练器初始化 ==================
 trainer = Trainer(
@@ -273,7 +304,8 @@ trainer = Trainer(
     data_collator=custom_data_collator,
     callbacks=[
         TrainProgressCallback(),
-        SaveTokenizerCallback()
+        SaveTokenizerCallback(),
+        MemoryMonitorCallback(log_steps=5)  # 每5步记录一次
     ]
 )
 
@@ -297,8 +329,42 @@ for name, param in model.named_parameters():
 model.save_pretrained(
     OUTPUT_DIR,
     safe_serialization=True,
-    save_embedding_layers="all"  # 关键参数
+    save_embedding_layers="unmerged"  # 改为不合并权重
 )
+
+# 初始化进程监控
+process = psutil.Process()
+
+def print_memory_usage(prefix=""):
+    # 获取CPU内存 (RSS)
+    cpu_mem = process.memory_info().rss // 1024 // 1024
+    # 获取GPU显存
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.memory_allocated() // 1024 // 1024
+        gpu_cache = torch.cuda.memory_reserved() // 1024 // 1024
+        print(f"{prefix} CPU内存: {cpu_mem}MB | GPU显存: {gpu_mem}MB | 缓存池: {gpu_cache}MB")
+    else:
+        print(f"{prefix} CPU内存: {cpu_mem}MB")
+
+# 在训练循环中定期调用
+
+def print_gpu_memory_info(device=0):
+    # 总显存（单位字节）
+    total_memory = torch.cuda.get_device_properties(device).total_memory
+
+    # 当前PyTorch分配并保留的显存（单位字节）
+    reserved_memory = torch.cuda.memory_reserved(device)
+    # 当前真正使用中的显存（单位字节）
+    allocated_memory = torch.cuda.memory_allocated(device)
+
+    # 根据PyTorch缓存机制计算"空闲"的显存
+    free_memory = total_memory - reserved_memory
+
+    print(f"设备 {device} 总显存: {total_memory//1024//1024}MB")
+    print(f"已保留显存: {reserved_memory//1024//1024}MB")
+    print(f"已使用显存: {allocated_memory//1024//1024}MB")
+    print(f"可分配空闲显存: {free_memory//1024//1024}MB")
+
 
 
 
@@ -307,7 +373,7 @@ if __name__ == "__main__":
         try:
             torch.cuda.empty_cache()
             gc.collect()
-            trainer.train(resume_from_checkpoint=True)
+            trainer.train(resume_from_checkpoint=False)
             break
         except Exception as e:
             print(e)
@@ -323,18 +389,3 @@ if __name__ == "__main__":
     trainer.model.save_pretrained(os.path.join(OUTPUT_DIR, "final_adapter"))
     model.save_pretrained(os.path.join(OUTPUT_DIR, "final_adapter"))
     tokenizer.save_pretrained(os.path.join(OUTPUT_DIR, "final_tokenizer"))
-    
-    # 验证加载
-    from peft import PeftModel
-    base_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        device_map="auto",
-        trust_remote_code=True
-    )
-    loaded_model = PeftModel.from_pretrained(base_model, os.path.join(OUTPUT_DIR, "final_adapter"))
-    
-    # 测试推理
-    input_text = "<|user|>\n你好<亚托莉>\n<|assistant|>\n"
-    inputs = tokenizer(input_text, return_tensors="pt").to(DEVICE)
-    outputs = loaded_model.generate(**inputs, max_new_tokens=50)
-    print("测试输出:", tokenizer.decode(outputs[0]))
